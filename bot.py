@@ -1,12 +1,15 @@
 # ═══════════════════════════════════════════════════════════════
 # NEMESH THREADS-АГЕНТ — автопостинг у Threads з підтвердженням
-# v1 (тільки текст). Картинки додамо у v2.
+# v2: додано картинки (кнопка 📷, карусель до 10 фото).
+#
+# БЕЗПЕКА: фото хостяться на власному домені агента (Railway), у Threads
+# іде чисте посилання. Токен бота ніде не світиться.
 #
 # Логіка:
 #   1. Читає банк тем із GitHub (сирий .md файл)
 #   2. Бере наступну неопубліковану тему
-#   3. Шле Артему в Telegram на підтвердження (👍 / ✍️ / ❌)
-#   4. Після 👍 — публікує в Threads
+#   3. Шле Артему в Telegram: 👍 / 📷 Додати фото / ✍️ / ❌
+#   4. Після 👍 — публікує в Threads (текст, фото або карусель)
 #   5. Веде лічильник, попереджає коли лишилось ≤3 теми
 #   6. Розклад: 2 пости/день (Київ), рознесені в часі
 # ═══════════════════════════════════════════════════════════════
@@ -14,8 +17,14 @@
 import logging
 import os
 import re
+import time
+import uuid
+import json
+import mimetypes
+import threading
 import sqlite3
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 
@@ -36,40 +45,83 @@ logger = logging.getLogger("threads-agent")
 # КОНФІГ (усе з env-змінних Railway, нічого в коді)
 # ───────────────────────────────────────────────
 
-TELEGRAM_TOKEN       = os.getenv("TELEGRAM_TOKEN")            # новий бот від BotFather
-OWNER_CHAT_ID        = int(os.getenv("OWNER_CHAT_ID", "0"))   # твій Telegram ID (428771141)
-THREADS_ACCESS_TOKEN = os.getenv("THREADS_ACCESS_TOKEN")      # токен, який ти згенерував
-BANK_URL             = os.getenv("BANK_URL", "")              # raw-посилання на temy.md у GitHub
+TELEGRAM_TOKEN       = os.getenv("TELEGRAM_TOKEN")
+OWNER_CHAT_ID        = int(os.getenv("OWNER_CHAT_ID", "0"))
+THREADS_ACCESS_TOKEN = os.getenv("THREADS_ACCESS_TOKEN")
+BANK_URL             = os.getenv("BANK_URL", "")
 
-# Час постів (Київ). Рознесені >4 год. Можна змінити через env.
-POST_HOUR_1 = int(os.getenv("POST_HOUR_1", "10"))            # 10:00
-POST_HOUR_2 = int(os.getenv("POST_HOUR_2", "18"))            # 18:00
+# Публічний домен агента (Railway → Settings → Networking → Generate Domain).
+# Напр. https://nemesh-threads-agent-production.up.railway.app
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+if not PUBLIC_BASE_URL and os.getenv("RAILWAY_PUBLIC_DOMAIN"):
+    PUBLIC_BASE_URL = "https://" + os.getenv("RAILWAY_PUBLIC_DOMAIN").rstrip("/")
+
+POST_HOUR_1 = int(os.getenv("POST_HOUR_1", "10"))
+POST_HOUR_2 = int(os.getenv("POST_HOUR_2", "18"))
 TZ = ZoneInfo("Europe/Kyiv")
 
-# Поріг попередження "банк закінчується"
 LOW_BANK_THRESHOLD = 3
-
-# Ліміт довжини поста в Threads
 THREADS_MAX_LEN = 500
+MAX_PHOTOS = 10
 
 GRAPH = "https://graph.threads.net/v1.0"
-DB_PATH = os.path.join(os.getenv("DATA_DIR", "/data"), "threads_agent.db") \
-    if os.path.isdir(os.getenv("DATA_DIR", "/data")) else "threads_agent.db"
 
-# Кеш ID користувача Threads (заповнюється при старті)
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+if not os.path.isdir(DATA_DIR):
+    DATA_DIR = "."
+DB_PATH = os.path.join(DATA_DIR, "threads_agent.db")
+IMAGES_DIR = os.path.join(DATA_DIR, "images")
+os.makedirs(IMAGES_DIR, exist_ok=True)
+
+WEB_PORT = int(os.getenv("PORT", "8080"))
+
 THREADS_USER_ID = None
 
 
 # ───────────────────────────────────────────────
-# БАЗА (пам'ять: що вже опубліковано + що зараз чекає)
+# МІНІ-СЕРВЕР ДЛЯ ФОТО (роздає /img/<файл> з тому)
+# ───────────────────────────────────────────────
+
+class ImgHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/" or self.path == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+        if self.path.startswith("/img/"):
+            name = os.path.basename(self.path[len("/img/"):])
+            fp = os.path.join(IMAGES_DIR, name)
+            if os.path.isfile(fp):
+                ctype = mimetypes.guess_type(fp)[0] or "application/octet-stream"
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                with open(fp, "rb") as f:
+                    self.wfile.write(f.read())
+                return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass  # не засмічуємо логи
+
+
+def start_img_server():
+    srv = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), ImgHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    logger.info(f"Фото-сервер запущено на порту {WEB_PORT}")
+
+
+# ───────────────────────────────────────────────
+# БАЗА (пам'ять)
 # ───────────────────────────────────────────────
 
 def db():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""CREATE TABLE IF NOT EXISTS published(
-        hash TEXT PRIMARY KEY, ts TEXT)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS state(
-        key TEXT PRIMARY KEY, value TEXT)""")
+    conn.execute("CREATE TABLE IF NOT EXISTS published(hash TEXT PRIMARY KEY, ts TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT)")
     return conn
 
 
@@ -82,8 +134,7 @@ def state_get(key, default=None):
 
 def state_set(key, value):
     conn = db()
-    conn.execute("INSERT OR REPLACE INTO state(key,value) VALUES(?,?)",
-                 (key, str(value)))
+    conn.execute("INSERT OR REPLACE INTO state(key,value) VALUES(?,?)", (key, str(value)))
     conn.commit()
     conn.close()
 
@@ -114,14 +165,37 @@ def post_hash(text):
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
 
 
+# --- допоміжне: список фото поточного поста (URL + локальні шляхи) ---
+
+def get_pending_images():
+    raw = state_get("pending_images")
+    return json.loads(raw) if raw else []
+
+
+def set_pending_images(items):
+    state_set("pending_images", json.dumps(items))
+
+
+def clear_pending():
+    for key in ("pending_hash", "pending_text", "await_edit",
+                "await_photos", "pending_images"):
+        state_del(key)
+
+
+def cleanup_image_files():
+    for it in get_pending_images():
+        try:
+            if it.get("path") and os.path.isfile(it["path"]):
+                os.remove(it["path"])
+        except Exception:
+            pass
+
+
 # ───────────────────────────────────────────────
-# БАНК ТЕМ (читання з GitHub)
+# БАНК ТЕМ
 # ───────────────────────────────────────────────
 
 def fetch_bank():
-    """Тягне banк з GitHub, повертає список текстів постів.
-       Пости розділені рядком '---'. Рядки, що починаються з '#', ігноруються
-       (це заголовки для навігації, не текст поста)."""
     if not BANK_URL:
         return []
     try:
@@ -131,11 +205,9 @@ def fetch_bank():
     except Exception as e:
         logger.error(f"Не вдалось завантажити банк: {e}")
         return []
-
     posts = []
     for chunk in re.split(r"(?m)^\s*---+\s*$", raw):
-        lines = [ln for ln in chunk.splitlines()
-                 if not ln.strip().startswith("#")]
+        lines = [ln for ln in chunk.splitlines() if not ln.strip().startswith("#")]
         text = "\n".join(lines).strip()
         if text:
             posts.append(text)
@@ -143,7 +215,6 @@ def fetch_bank():
 
 
 def next_unpublished():
-    """Повертає (text, hash) наступного неопублікованого поста, або (None, None)."""
     for text in fetch_bank():
         h = post_hash(text)
         if not is_published(h):
@@ -164,8 +235,8 @@ def get_threads_user_id():
     if THREADS_USER_ID:
         return THREADS_USER_ID
     r = requests.get(f"{GRAPH}/me",
-                     params={"fields": "id,username",
-                             "access_token": THREADS_ACCESS_TOKEN}, timeout=20)
+                     params={"fields": "id,username", "access_token": THREADS_ACCESS_TOKEN},
+                     timeout=20)
     r.raise_for_status()
     data = r.json()
     THREADS_USER_ID = data["id"]
@@ -173,33 +244,62 @@ def get_threads_user_id():
     return THREADS_USER_ID
 
 
-def publish_to_threads(text, image_url=None):
-    """Публікує пост. Повертає (True, url) або (False, помилка).
-       image_url — на майбутнє (v2); поки завжди None."""
+def _publish_container(uid, creation_id):
+    """Публікує контейнер із кількома спробами (медіа інколи готується не миттєво)."""
+    last = ""
+    for attempt in range(4):
+        r = requests.post(f"{GRAPH}/{uid}/threads_publish",
+                          params={"access_token": THREADS_ACCESS_TOKEN,
+                                  "creation_id": creation_id}, timeout=30)
+        if r.ok:
+            return r.json()["id"]
+        last = r.text
+        time.sleep(4)
+    raise RuntimeError(f"publish не вдався: {last}")
+
+
+def publish_to_threads(text, image_urls=None):
+    """Публікує пост. image_urls: [] текст, [1] фото, [2..10] карусель.
+       Повертає (True, url) або (False, помилка)."""
+    image_urls = image_urls or []
     try:
         uid = get_threads_user_id()
 
-        # Крок 1: створити контейнер
-        params = {"access_token": THREADS_ACCESS_TOKEN, "text": text}
-        if image_url:
-            params["media_type"] = "IMAGE"
-            params["image_url"] = image_url
+        if not image_urls:
+            params = {"access_token": THREADS_ACCESS_TOKEN, "media_type": "TEXT", "text": text}
+            r1 = requests.post(f"{GRAPH}/{uid}/threads", params=params, timeout=30)
+            r1.raise_for_status()
+            creation_id = r1.json()["id"]
+
+        elif len(image_urls) == 1:
+            params = {"access_token": THREADS_ACCESS_TOKEN, "media_type": "IMAGE",
+                      "image_url": image_urls[0], "text": text}
+            r1 = requests.post(f"{GRAPH}/{uid}/threads", params=params, timeout=30)
+            r1.raise_for_status()
+            creation_id = r1.json()["id"]
+
         else:
-            params["media_type"] = "TEXT"
+            child_ids = []
+            for url in image_urls[:MAX_PHOTOS]:
+                rc = requests.post(f"{GRAPH}/{uid}/threads",
+                                   params={"access_token": THREADS_ACCESS_TOKEN,
+                                           "media_type": "IMAGE",
+                                           "is_carousel_item": "true",
+                                           "image_url": url}, timeout=30)
+                rc.raise_for_status()
+                child_ids.append(rc.json()["id"])
+                time.sleep(1)
+            rp = requests.post(f"{GRAPH}/{uid}/threads",
+                               params={"access_token": THREADS_ACCESS_TOKEN,
+                                       "media_type": "CAROUSEL",
+                                       "children": ",".join(child_ids),
+                                       "text": text}, timeout=30)
+            rp.raise_for_status()
+            creation_id = rp.json()["id"]
 
-        r1 = requests.post(f"{GRAPH}/{uid}/threads", params=params, timeout=30)
-        r1.raise_for_status()
-        creation_id = r1.json()["id"]
+        media_id = _publish_container(uid, creation_id)
 
-        # Крок 2: опублікувати контейнер
-        r2 = requests.post(f"{GRAPH}/{uid}/threads_publish",
-                           params={"access_token": THREADS_ACCESS_TOKEN,
-                                   "creation_id": creation_id}, timeout=30)
-        r2.raise_for_status()
-        media_id = r2.json()["id"]
-
-        # Спробувати дістати посилання на пост (не критично)
-        url = f"https://www.threads.net/@_nemesh_artem_"
+        url = "https://www.threads.net/@_nemesh_artem_"
         try:
             r3 = requests.get(f"{GRAPH}/{media_id}",
                               params={"fields": "permalink",
@@ -208,8 +308,8 @@ def publish_to_threads(text, image_url=None):
                 url = r3.json()["permalink"]
         except Exception:
             pass
-
         return True, url
+
     except Exception as e:
         detail = ""
         try:
@@ -221,7 +321,6 @@ def publish_to_threads(text, image_url=None):
 
 
 def refresh_token():
-    """Оновлює довгоживучий токен (діє ~60 днів). Запускається раз на місяць."""
     global THREADS_ACCESS_TOKEN
     try:
         r = requests.get(f"{GRAPH}/refresh_access_token",
@@ -238,66 +337,82 @@ def refresh_token():
 
 
 # ───────────────────────────────────────────────
-# TELEGRAM — надсилання на підтвердження
+# ПУБЛІКАЦІЯ ПОТОЧНОГО ПОСТА (загальний шлях)
+# ───────────────────────────────────────────────
+
+async def publish_pending(bot, text_override=None):
+    """Публікує поточний pending-пост із зібраними фото. Чистить стан."""
+    h = state_get("pending_hash")
+    text = text_override if text_override is not None else state_get("pending_text")
+    urls = [it["url"] for it in get_pending_images()]
+
+    ok, res = publish_to_threads(text, urls)
+    if ok:
+        if h:
+            mark_published(h)
+        cleanup_image_files()
+        clear_pending()
+        suffix = f" з {len(urls)} фото" if urls else ""
+        await bot.send_message(OWNER_CHAT_ID, f"✅ Опубліковано{suffix}!\n{res}")
+    else:
+        await bot.send_message(OWNER_CHAT_ID, f"❌ Не вийшло опублікувати:\n{res}")
+
+
+# ───────────────────────────────────────────────
+# TELEGRAM — клавіатури
 # ───────────────────────────────────────────────
 
 def approval_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👍 Опублікувати", callback_data="approve"),
+         InlineKeyboardButton("📷 Додати фото", callback_data="addphoto")],
+        [InlineKeyboardButton("✍️ Переписати", callback_data="rewrite"),
+         InlineKeyboardButton("❌ Скасувати", callback_data="cancel")],
+    ])
+
+
+def photos_keyboard():
+    n = len(get_pending_images())
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("👍 Опублікувати", callback_data="approve"),
-        InlineKeyboardButton("✍️ Переписати",  callback_data="rewrite"),
-        InlineKeyboardButton("❌ Скасувати",    callback_data="cancel"),
+        InlineKeyboardButton(f"✅ Опублікувати з фото ({n})", callback_data="donephotos"),
+        InlineKeyboardButton("❌ Скасувати", callback_data="cancel"),
     ]])
 
 
 async def send_for_approval(app, text, h):
-    """Шле пост Артему на підтвердження і ставить pending."""
+    clear_pending()
     state_set("pending_hash", h)
     state_set("pending_text", text)
-    state_del("await_edit")
 
     left = remaining_count()
     header = f"📝 <b>Пост на сьогодні</b>  ·  у банку лишилось: {left}\n\n"
-    await app.bot.send_message(
-        chat_id=OWNER_CHAT_ID,
-        text=header + text,
-        parse_mode="HTML",
-        reply_markup=approval_keyboard()
-    )
+    await app.bot.send_message(chat_id=OWNER_CHAT_ID, text=header + text,
+                               parse_mode="HTML", reply_markup=approval_keyboard())
 
     if left <= LOW_BANK_THRESHOLD:
         await app.bot.send_message(
             chat_id=OWNER_CHAT_ID,
             text=f"⚠️ Банк тем майже порожній ({left} лишилось). "
-                 f"Час згенерувати нові й оновити файл temy.md у GitHub."
-        )
+                 f"Час згенерувати нові й оновити temy.md у GitHub.")
 
 
 # ───────────────────────────────────────────────
-# ПЛАНОВИЙ ЗАПУСК ПОСТА
+# ПЛАНОВИЙ ЗАПУСК
 # ───────────────────────────────────────────────
 
 async def do_scheduled_post(app):
-    # якщо вже щось чекає підтвердження — не шлемо новий, щоб не плутати
     if state_get("pending_hash"):
         logger.info("Пропускаю запуск: попередній пост ще не підтверджено.")
         return
-
     text, h = next_unpublished()
     if not text:
-        await app.bot.send_message(
-            chat_id=OWNER_CHAT_ID,
-            text="📭 Банк тем порожній — постити нічого. Онови temy.md у GitHub."
-        )
+        await app.bot.send_message(OWNER_CHAT_ID,
+            "📭 Банк тем порожній. Онови temy.md у GitHub.")
         return
-
     if len(text) > THREADS_MAX_LEN:
-        await app.bot.send_message(
-            chat_id=OWNER_CHAT_ID,
-            text=f"⚠️ Тема задовга для Threads ({len(text)}/{THREADS_MAX_LEN}). "
-                 f"Скороти в банку:\n\n{text}"
-        )
+        await app.bot.send_message(OWNER_CHAT_ID,
+            f"⚠️ Тема задовга ({len(text)}/{THREADS_MAX_LEN}). Скороти в банку:\n\n{text}")
         return
-
     await send_for_approval(app, text, h)
 
 
@@ -316,43 +431,79 @@ async def job_refresh_token(ctx: ContextTypes.DEFAULT_TYPE):
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     if q.message.chat_id != OWNER_CHAT_ID:
         return
 
     action = q.data
-    h = state_get("pending_hash")
-    text = state_get("pending_text")
-
-    if not h:
+    if not state_get("pending_hash"):
         await q.edit_message_reply_markup(reply_markup=None)
         await ctx.bot.send_message(OWNER_CHAT_ID, "Цей пост уже оброблено.")
         return
 
     if action == "approve":
-        ok, res = publish_to_threads(text)
-        if ok:
-            mark_published(h)
-            state_del("pending_hash"); state_del("pending_text"); state_del("await_edit")
-            await q.edit_message_reply_markup(reply_markup=None)
-            await ctx.bot.send_message(OWNER_CHAT_ID, f"✅ Опубліковано!\n{res}")
-        else:
-            await ctx.bot.send_message(OWNER_CHAT_ID, f"❌ Не вийшло опублікувати:\n{res}")
+        await q.edit_message_reply_markup(reply_markup=None)
+        await publish_pending(ctx.bot)
+
+    elif action == "addphoto":
+        if not PUBLIC_BASE_URL:
+            await ctx.bot.send_message(OWNER_CHAT_ID,
+                "⚠️ Фото поки недоступні: не задано PUBLIC_BASE_URL у Railway.")
+            return
+        state_set("await_photos", "1")
+        await q.edit_message_reply_markup(reply_markup=None)
+        await ctx.bot.send_message(
+            OWNER_CHAT_ID,
+            f"📷 Кидай фото (до {MAX_PHOTOS}). Коли все — натисни кнопку нижче.",
+            reply_markup=photos_keyboard())
+
+    elif action == "donephotos":
+        state_del("await_photos")
+        await q.edit_message_reply_markup(reply_markup=None)
+        if not get_pending_images():
+            await ctx.bot.send_message(OWNER_CHAT_ID,
+                "Фото не додано. Публікую текстом.")
+        await publish_pending(ctx.bot)
 
     elif action == "rewrite":
         state_set("await_edit", "1")
         await q.edit_message_reply_markup(reply_markup=None)
-        await ctx.bot.send_message(
-            OWNER_CHAT_ID,
-            "✍️ Надішли свій варіант тексту наступним повідомленням — "
-            "я опублікую саме його."
-        )
+        await ctx.bot.send_message(OWNER_CHAT_ID,
+            "✍️ Надішли свій варіант тексту наступним повідомленням.")
 
     elif action == "cancel":
-        # не постимо, тему НЕ позначаємо опублікованою (лишиться на потім)
-        state_del("pending_hash"); state_del("pending_text"); state_del("await_edit")
+        cleanup_image_files()
+        clear_pending()
         await q.edit_message_reply_markup(reply_markup=None)
         await ctx.bot.send_message(OWNER_CHAT_ID, "🚫 Скасовано. Тема лишилась у банку.")
+
+
+# ───────────────────────────────────────────────
+# ОБРОБКА ФОТО (після 📷)
+# ───────────────────────────────────────────────
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != OWNER_CHAT_ID:
+        return
+    if state_get("await_photos") != "1":
+        return
+    items = get_pending_images()
+    if len(items) >= MAX_PHOTOS:
+        await update.message.reply_text(f"Вже {MAX_PHOTOS} фото, більше не можна.")
+        return
+    try:
+        photo = update.message.photo[-1]  # найбільша якість
+        f = await photo.get_file()
+        name = uuid.uuid4().hex + ".jpg"
+        path = os.path.join(IMAGES_DIR, name)
+        await f.download_to_drive(path)
+        url = f"{PUBLIC_BASE_URL}/img/{name}"
+        items.append({"url": url, "path": path})
+        set_pending_images(items)
+        await update.message.reply_text(f"Додав фото {len(items)}.",
+                                        reply_markup=photos_keyboard())
+    except Exception as e:
+        logger.error(f"Помилка збереження фото: {e}")
+        await update.message.reply_text("Не вдалось зберегти фото, спробуй ще раз.")
 
 
 # ───────────────────────────────────────────────
@@ -363,24 +514,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != OWNER_CHAT_ID:
         return
     if state_get("await_edit") != "1":
-        return  # не в режимі редагування — ігноруємо
-
+        return
     new_text = update.message.text.strip()
     if len(new_text) > THREADS_MAX_LEN:
         await update.message.reply_text(
-            f"⚠️ Задовго ({len(new_text)}/{THREADS_MAX_LEN}). Скороти і надішли ще раз."
-        )
+            f"⚠️ Задовго ({len(new_text)}/{THREADS_MAX_LEN}). Скороти і надішли ще раз.")
         return
-
-    ok, res = publish_to_threads(new_text)
-    if ok:
-        h = state_get("pending_hash")
-        if h:
-            mark_published(h)  # оригінальну тему вважаємо використаною
-        state_del("pending_hash"); state_del("pending_text"); state_del("await_edit")
-        await update.message.reply_text(f"✅ Опубліковано твій варіант!\n{res}")
-    else:
-        await update.message.reply_text(f"❌ Не вийшло опублікувати:\n{res}")
+    state_del("await_edit")
+    await publish_pending(ctx.bot, text_override=new_text)
 
 
 # ───────────────────────────────────────────────
@@ -394,10 +535,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привіт! Я Threads-агент NEMESH.\n\n"
         "Команди:\n"
-        "/post — запропонувати пост прямо зараз (для тесту)\n"
-        "/status — скільки тем лишилось у банку\n"
-        "/whoami — показати твій Telegram ID"
-    )
+        "/post — запропонувати пост зараз (для тесту)\n"
+        "/status — скільки тем лишилось\n"
+        "/whoami — показати твій Telegram ID")
 
 
 async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -411,12 +551,13 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     left = remaining_count()
     pending = "так" if state_get("pending_hash") else "ні"
+    photos = "так" if PUBLIC_BASE_URL else "НЕ налаштовано (PUBLIC_BASE_URL)"
     await update.message.reply_text(
         f"📊 Статус:\n"
-        f"• Тем у банку (неопублікованих): {left}\n"
+        f"• Тем у банку: {left}\n"
         f"• Чекає підтвердження: {pending}\n"
-        f"• Розклад: {POST_HOUR_1}:00 і {POST_HOUR_2}:00 (Київ)"
-    )
+        f"• Фото: {photos}\n"
+        f"• Розклад: {POST_HOUR_1}:00 і {POST_HOUR_2}:00 (Київ)")
 
 
 async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -428,11 +569,12 @@ async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ───────────────────────────────────────────────
 
 def main():
-    # відновити оновлений токен з бази, якщо був
     saved = state_get("access_token")
     if saved:
         global THREADS_ACCESS_TOKEN
         THREADS_ACCESS_TOKEN = saved
+
+    start_img_server()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -441,16 +583,15 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # Розклад через вбудований JobQueue (надійніше за окремий планувальник)
     jq = app.job_queue
     jq.run_daily(job_scheduled_post, time=dt_time(POST_HOUR_1, 0, tzinfo=TZ))
     jq.run_daily(job_scheduled_post, time=dt_time(POST_HOUR_2, 0, tzinfo=TZ))
-    # Оновлення токена раз на місяць (кожні 30 днів)
     jq.run_repeating(job_refresh_token, interval=30 * 24 * 3600, first=60)
 
-    logger.info("Threads-агент запущено.")
+    logger.info("Threads-агент (v2) запущено.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
