@@ -1,14 +1,16 @@
 # ═══════════════════════════════════════════════════════════════
 # NEMESH THREADS-АГЕНТ — автопостинг у Threads з підтвердженням
-# v2: додано картинки (кнопка 📷, карусель до 10 фото).
+# v3: + постійний "Пропустити" (тема більше ніколи не пропонується).
+# Статистику/аналітику бот навмисно НЕ тягне з Threads API — аналіз
+# постів робимо вручну, щоб не робити зайвих запитів до Meta API.
 #
 # БЕЗПЕКА: фото хостяться на власному домені агента (Railway), у Threads
 # іде чисте посилання. Токен бота ніде не світиться.
 #
 # Логіка:
 #   1. Читає банк тем із GitHub (сирий .md файл)
-#   2. Бере наступну неопубліковану тему
-#   3. Шле Артему в Telegram: 👍 / 📷 Додати фото / ✍️ / ❌
+#   2. Бере наступну неопубліковану і непропущену тему
+#   3. Шле Артему в Telegram: 👍 / 📷 Додати фото / ✍️ / ❌ / ⏭ Пропустити
 #   4. Після 👍 — публікує в Threads (текст, фото або карусель)
 #   5. Веде лічильник, попереджає коли лишилось ≤3 теми
 #   6. Розклад: 2 пости/день (Київ), рознесені в часі
@@ -121,6 +123,7 @@ def start_img_server():
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("CREATE TABLE IF NOT EXISTS published(hash TEXT PRIMARY KEY, ts TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS skipped(hash TEXT PRIMARY KEY, ts TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT)")
     return conn
 
@@ -159,6 +162,28 @@ def mark_published(text_hash):
                  (text_hash, datetime.now(TZ).isoformat()))
     conn.commit()
     conn.close()
+
+
+def is_skipped(text_hash):
+    conn = db()
+    row = conn.execute("SELECT 1 FROM skipped WHERE hash=?", (text_hash,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_skipped(text_hash):
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO skipped(hash, ts) VALUES(?,?)",
+                 (text_hash, datetime.now(TZ).isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def skipped_count():
+    conn = db()
+    n = conn.execute("SELECT COUNT(*) FROM skipped").fetchone()[0]
+    conn.close()
+    return n
 
 
 def post_hash(text):
@@ -217,13 +242,16 @@ def fetch_bank():
 def next_unpublished():
     for text in fetch_bank():
         h = post_hash(text)
-        if not is_published(h):
+        if not is_published(h) and not is_skipped(h):
             return text, h
     return None, None
 
 
 def remaining_count():
-    return sum(1 for text in fetch_bank() if not is_published(post_hash(text)))
+    return sum(
+        1 for text in fetch_bank()
+        if not is_published(post_hash(text)) and not is_skipped(post_hash(text))
+    )
 
 
 # ───────────────────────────────────────────────
@@ -368,6 +396,7 @@ def approval_keyboard():
          InlineKeyboardButton("📷 Додати фото", callback_data="addphoto")],
         [InlineKeyboardButton("✍️ Переписати", callback_data="rewrite"),
          InlineKeyboardButton("❌ Скасувати", callback_data="cancel")],
+        [InlineKeyboardButton("⏭ Пропустити назавжди", callback_data="skip")],
     ])
 
 
@@ -476,6 +505,17 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(reply_markup=None)
         await ctx.bot.send_message(OWNER_CHAT_ID, "🚫 Скасовано. Тема лишилась у банку.")
 
+    elif action == "skip":
+        h = state_get("pending_hash")
+        if h:
+            mark_skipped(h)
+        cleanup_image_files()
+        clear_pending()
+        await q.edit_message_reply_markup(reply_markup=None)
+        await ctx.bot.send_message(OWNER_CHAT_ID,
+            "⏭ Пропущено назавжди, цю тему більше не запропоную. Шукаю наступну…")
+        await do_scheduled_post(ctx.application)
+
 
 # ───────────────────────────────────────────────
 # ОБРОБКА ФОТО (після 📷)
@@ -555,6 +595,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 Статус:\n"
         f"• Тем у банку: {left}\n"
+        f"• Пропущено назавжди: {skipped_count()}\n"
         f"• Чекає підтвердження: {pending}\n"
         f"• Фото: {photos}\n"
         f"• Розклад: {POST_HOUR_1}:00 і {POST_HOUR_2}:00 (Київ)")
@@ -591,7 +632,7 @@ def main():
     jq.run_daily(job_scheduled_post, time=dt_time(POST_HOUR_2, 0, tzinfo=TZ))
     jq.run_repeating(job_refresh_token, interval=30 * 24 * 3600, first=60)
 
-    logger.info("Threads-агент (v2) запущено.")
+    logger.info("Threads-агент (v3) запущено.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
