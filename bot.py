@@ -431,7 +431,13 @@ async def send_for_approval(app, text, h):
 
 async def do_scheduled_post(app):
     if state_get("pending_hash"):
-        logger.info("Пропускаю запуск: попередній пост ще не підтверджено.")
+        logger.info("Попередній пост ще не підтверджено, нагадую замість тиші.")
+        pending_text = state_get("pending_text") or ""
+        await app.bot.send_message(
+            OWNER_CHAT_ID,
+            "⏳ У мене досі є пост, що чекає твого рішення. Обери дію нижче, "
+            "і я одразу запропоную наступний:\n\n" + pending_text,
+            reply_markup=approval_keyboard())
         return
     text, h = next_unpublished()
     if not text:
