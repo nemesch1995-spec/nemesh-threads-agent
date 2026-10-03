@@ -1,6 +1,7 @@
 # ═══════════════════════════════════════════════════════════════
 # NEMESH THREADS-АГЕНТ — автопостинг у Threads з підтвердженням
-# v3: + постійний "Пропустити" (тема більше ніколи не пропонується).
+# v4: + постійне меню внизу (кнопка "Опублікувати зараз" / "Статус"),
+#     поверх v3 ("Пропустити назавжди").
 # Статистику/аналітику бот навмисно НЕ тягне з Threads API — аналіз
 # постів робимо вручну, щоб не робити зайвих запитів до Meta API.
 #
@@ -14,6 +15,9 @@
 #   4. Після 👍 — публікує в Threads (текст, фото або карусель)
 #   5. Веде лічильник, попереджає коли лишилось ≤3 теми
 #   6. Розклад: 2 пости/день (Київ), рознесені в часі
+#   7. Внизу завжди меню: можна будь-коли вручну підтягнути наступний
+#      пост із банку, не чекаючи розкладу (той самий пост просто
+#      йде в обробку як завжди і позначається опублікованим).
 # ═══════════════════════════════════════════════════════════════
 
 import logging
@@ -31,7 +35,10 @@ from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton
+)
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
@@ -78,6 +85,16 @@ os.makedirs(IMAGES_DIR, exist_ok=True)
 WEB_PORT = int(os.getenv("PORT", "8080"))
 
 THREADS_USER_ID = None
+
+# Текст кнопок постійного меню (reply-клавіатура, не inline і не команда)
+BTN_POST_NOW = "📨 Опублікувати зараз"
+BTN_STATUS = "📊 Статус"
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton(BTN_POST_NOW)], [KeyboardButton(BTN_STATUS)]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 
 # ───────────────────────────────────────────────
@@ -426,7 +443,7 @@ async def send_for_approval(app, text, h):
 
 
 # ───────────────────────────────────────────────
-# ПЛАНОВИЙ ЗАПУСК
+# ПЛАНОВИЙ ЗАПУСК (а також ручний — з меню чи /post)
 # ───────────────────────────────────────────────
 
 async def do_scheduled_post(app):
@@ -459,8 +476,21 @@ async def job_refresh_token(ctx: ContextTypes.DEFAULT_TYPE):
     refresh_token()
 
 
+async def job_send_menu(ctx: ContextTypes.DEFAULT_TYPE):
+    """Надсилає постійне меню внизу одразу після старту бота, щоб воно
+       завжди було під рукою, навіть після передеплою."""
+    try:
+        await ctx.bot.send_message(
+            OWNER_CHAT_ID,
+            "Меню активне ⬇️ Можна будь-коли підтягнути наступний пост вручну, "
+            "не чекаючи розкладу.",
+            reply_markup=MAIN_KEYBOARD)
+    except Exception as e:
+        logger.error(f"Не вдалось надіслати меню: {e}")
+
+
 # ───────────────────────────────────────────────
-# ОБРОБКА КНОПОК
+# ОБРОБКА КНОПОК (inline, під конкретним постом)
 # ───────────────────────────────────────────────
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -524,6 +554,22 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ───────────────────────────────────────────────
+# ПОСТІЙНЕ МЕНЮ ВНИЗУ (reply-клавіатура)
+# ───────────────────────────────────────────────
+
+async def on_menu_post_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != OWNER_CHAT_ID:
+        return
+    await do_scheduled_post(ctx.application)
+
+
+async def on_menu_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != OWNER_CHAT_ID:
+        return
+    await cmd_status(update, ctx)
+
+
+# ───────────────────────────────────────────────
 # ОБРОБКА ФОТО (після 📷)
 # ───────────────────────────────────────────────
 
@@ -583,7 +629,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Команди:\n"
         "/post — запропонувати пост зараз (для тесту)\n"
         "/status — скільки тем лишилось\n"
-        "/whoami — показати твій Telegram ID")
+        "/whoami — показати твій Telegram ID\n\n"
+        "Внизу завжди є меню: кнопка \"Опублікувати зараз\" робить те саме, "
+        "що /post, без потреби щось набирати.",
+        reply_markup=MAIN_KEYBOARD)
 
 
 async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -604,7 +653,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"• Пропущено назавжди: {skipped_count()}\n"
         f"• Чекає підтвердження: {pending}\n"
         f"• Фото: {photos}\n"
-        f"• Розклад: {POST_HOUR_1}:00 і {POST_HOUR_2}:00 (Київ)")
+        f"• Розклад: {POST_HOUR_1}:00 і {POST_HOUR_2}:00 (Київ)",
+        reply_markup=MAIN_KEYBOARD)
 
 
 async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -630,6 +680,12 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CallbackQueryHandler(on_button))
+
+    # Кнопки постійного меню — ДО загального текстового хендлера,
+    # інакше on_text їх перехопить першим.
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_POST_NOW)}$"), on_menu_post_now))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_STATUS)}$"), on_menu_status))
+
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
@@ -637,8 +693,9 @@ def main():
     jq.run_daily(job_scheduled_post, time=dt_time(POST_HOUR_1, 0, tzinfo=TZ))
     jq.run_daily(job_scheduled_post, time=dt_time(POST_HOUR_2, 0, tzinfo=TZ))
     jq.run_repeating(job_refresh_token, interval=30 * 24 * 3600, first=60)
+    jq.run_once(job_send_menu, when=3)
 
-    logger.info("Threads-агент (v3) запущено.")
+    logger.info("Threads-агент (v4) запущено.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
