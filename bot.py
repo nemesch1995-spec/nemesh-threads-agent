@@ -52,6 +52,8 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("threads-agent")
+# httpx пише в лог повні URL запитів до Telegram, а в них токен бота. Глушимо.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ───────────────────────────────────────────────
 # КОНФІГ (усе з env-змінних Railway, нічого в коді)
