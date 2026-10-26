@@ -1,5 +1,7 @@
 # ═══════════════════════════════════════════════════════════════
 # NEMESH THREADS-АГЕНТ — автопостинг у Threads з підтвердженням
+# v5: + третій слот (13:00) під кейси, кнопка "Пропустити наступний слот",
+#     авто-пропуск слоту, якщо Артем сам публікував у Threads останні 3 год.
 # v4: + постійне меню внизу (кнопка "Опублікувати зараз" / "Статус"),
 #     поверх v3 ("Пропустити назавжди").
 # Статистику/аналітику бот навмисно НЕ тягне з Threads API — аналіз
@@ -14,7 +16,8 @@
 #   3. Шле Артему в Telegram: 👍 / 📷 Додати фото / ✍️ / ❌ / ⏭ Пропустити
 #   4. Після 👍 — публікує в Threads (текст, фото або карусель)
 #   5. Веде лічильник, попереджає коли лишилось ≤3 теми
-#   6. Розклад: 2 пости/день (Київ), рознесені в часі
+#   6. Розклад: 3 пости/день (Київ): 10:00 і 18:00 звичайні теми,
+#      13:00 кейси (пости з рядком "# кейс" у банку)
 #   7. Внизу завжди меню: можна будь-коли вручну підтягнути наступний
 #      пост із банку, не чекаючи розкладу (той самий пост просто
 #      йде в обробку як завжди і позначається опублікованим).
@@ -67,6 +70,11 @@ if not PUBLIC_BASE_URL and os.getenv("RAILWAY_PUBLIC_DOMAIN"):
 
 POST_HOUR_1 = int(os.getenv("POST_HOUR_1", "10"))
 POST_HOUR_2 = int(os.getenv("POST_HOUR_2", "18"))
+# Слот для кейсів. Порожнє значення або "off" вимикає третій пост.
+_h3 = os.getenv("POST_HOUR_3", "13").strip().lower()
+POST_HOUR_3 = int(_h3) if _h3.isdigit() else None
+# Якщо в Threads був пост (свій чи ручний) менше ніж N год тому, слот пропускається.
+MIN_GAP_HOURS = float(os.getenv("MIN_GAP_HOURS", "3"))
 TZ = ZoneInfo("Europe/Kyiv")
 
 LOW_BANK_THRESHOLD = 3
@@ -89,9 +97,10 @@ THREADS_USER_ID = None
 # Текст кнопок постійного меню (reply-клавіатура, не inline і не команда)
 BTN_POST_NOW = "📨 Опублікувати зараз"
 BTN_STATUS = "📊 Статус"
+BTN_SKIP_SLOT = "⏸ Пропустити наступний слот"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[KeyboardButton(BTN_POST_NOW)], [KeyboardButton(BTN_STATUS)]],
+    [[KeyboardButton(BTN_POST_NOW)], [KeyboardButton(BTN_SKIP_SLOT)], [KeyboardButton(BTN_STATUS)]],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -249,25 +258,32 @@ def fetch_bank():
         return []
     posts = []
     for chunk in re.split(r"(?m)^\s*---+\s*$", raw):
+        kind = "case" if re.search(r"(?mi)^\s*#\s*кейс", chunk) else "general"
         lines = [ln for ln in chunk.splitlines() if not ln.strip().startswith("#")]
         text = "\n".join(lines).strip()
         if text:
-            posts.append(text)
+            posts.append((text, kind))
     return posts
 
 
-def next_unpublished():
-    for text in fetch_bank():
-        h = post_hash(text)
-        if not is_published(h) and not is_skipped(h):
-            return text, h
+def next_unpublished(kind=None):
+    """Наступна тема потрібного типу ("case"/"general"). Якщо такого типу
+       не лишилось, бере будь-яку, щоб слот не простоював."""
+    fresh = [(t, k) for t, k in fetch_bank()
+             if not is_published(post_hash(t)) and not is_skipped(post_hash(t))]
+    for t, k in fresh:
+        if kind is None or k == kind:
+            return t, post_hash(t)
+    if fresh:
+        return fresh[0][0], post_hash(fresh[0][0])
     return None, None
 
 
-def remaining_count():
+def remaining_count(kind=None):
     return sum(
-        1 for text in fetch_bank()
-        if not is_published(post_hash(text)) and not is_skipped(post_hash(text))
+        1 for t, k in fetch_bank()
+        if (kind is None or k == kind)
+        and not is_published(post_hash(t)) and not is_skipped(post_hash(t))
     )
 
 
@@ -287,6 +303,37 @@ def get_threads_user_id():
     THREADS_USER_ID = data["id"]
     logger.info(f"Threads user: @{data.get('username')} (id={THREADS_USER_ID})")
     return THREADS_USER_ID
+
+
+def minutes_since_last_post():
+    """Скільки хвилин минуло з останнього поста в Threads (будь-якого: від бота
+       чи опублікованого вручну). None, якщо дізнатись не вдалось."""
+    try:
+        uid = get_threads_user_id()
+        r = requests.get(f"{GRAPH}/{uid}/threads",
+                         params={"fields": "timestamp", "limit": 1,
+                                 "access_token": THREADS_ACCESS_TOKEN}, timeout=20)
+        r.raise_for_status()
+        items = r.json().get("data", [])
+        if not items:
+            return None
+        ts = datetime.strptime(items[0]["timestamp"], "%Y-%m-%dT%H:%M:%S%z")
+        return (datetime.now(TZ) - ts).total_seconds() / 60
+    except Exception as e:
+        logger.error(f"Не вдалось перевірити останній пост: {e}")
+        return None
+
+
+def slot_hours():
+    return sorted(h for h in (POST_HOUR_1, POST_HOUR_3, POST_HOUR_2) if h is not None)
+
+
+def next_slot_hour():
+    now = datetime.now(TZ)
+    for h in slot_hours():
+        if h > now.hour or (h == now.hour and now.minute == 0):
+            return h
+    return slot_hours()[0]
 
 
 def _publish_container(uid, creation_id):
@@ -431,7 +478,8 @@ async def send_for_approval(app, text, h):
     state_set("pending_text", text)
 
     left = remaining_count()
-    header = f"📝 <b>Пост на сьогодні</b>  ·  у банку лишилось: {left}\n\n"
+    header = (f"📝 <b>Пост на сьогодні</b>  ·  у банку лишилось: {left} "
+              f"(кейсів {remaining_count('case')})\n\n")
     await app.bot.send_message(chat_id=OWNER_CHAT_ID, text=header + text,
                                parse_mode="HTML", reply_markup=approval_keyboard())
 
@@ -446,7 +494,7 @@ async def send_for_approval(app, text, h):
 # ПЛАНОВИЙ ЗАПУСК (а також ручний — з меню чи /post)
 # ───────────────────────────────────────────────
 
-async def do_scheduled_post(app):
+async def do_scheduled_post(app, kind=None):
     if state_get("pending_hash"):
         logger.info("Попередній пост ще не підтверджено, нагадую замість тиші.")
         pending_text = state_get("pending_text") or ""
@@ -456,7 +504,7 @@ async def do_scheduled_post(app):
             "і я одразу запропоную наступний:\n\n" + pending_text,
             reply_markup=approval_keyboard())
         return
-    text, h = next_unpublished()
+    text, h = next_unpublished(kind)
     if not text:
         await app.bot.send_message(OWNER_CHAT_ID,
             "📭 Банк тем порожній. Онови temy.md у GitHub.")
@@ -469,7 +517,29 @@ async def do_scheduled_post(app):
 
 
 async def job_scheduled_post(ctx: ContextTypes.DEFAULT_TYPE):
-    await do_scheduled_post(ctx.application)
+    slot = ctx.job.data or {}
+    hour, kind = slot.get("hour"), slot.get("kind")
+
+    # 1) Артем попросив пропустити цей слот
+    if state_get("skip_next_slot") == "1":
+        state_del("skip_next_slot")
+        await ctx.bot.send_message(
+            OWNER_CHAT_ID,
+            f"⏸ Пропустив слот {hour}:00, як ти просив. Наступний о {next_slot_hour()}:00.",
+            reply_markup=MAIN_KEYBOARD)
+        return
+
+    # 2) Нещодавно вже був пост (наприклад, ти опублікував щось сам)
+    mins = minutes_since_last_post()
+    if mins is not None and mins < MIN_GAP_HOURS * 60 and not state_get("pending_hash"):
+        await ctx.bot.send_message(
+            OWNER_CHAT_ID,
+            f"⏸ Пропустив слот {hour}:00: останній пост у Threads був {int(mins)} хв тому, "
+            f"не хочу два пости поспіль. Наступний о {next_slot_hour()}:00.",
+            reply_markup=MAIN_KEYBOARD)
+        return
+
+    await do_scheduled_post(ctx.application, kind)
 
 
 async def job_refresh_token(ctx: ContextTypes.DEFAULT_TYPE):
@@ -563,6 +633,23 @@ async def on_menu_post_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await do_scheduled_post(ctx.application)
 
 
+async def on_menu_skip_slot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != OWNER_CHAT_ID:
+        return
+    h = next_slot_hour()
+    if state_get("skip_next_slot") == "1":
+        state_del("skip_next_slot")
+        await update.message.reply_text(
+            f"▶️ Добре, пропуск скасовано. Слот {h}:00 спрацює як звичайно.",
+            reply_markup=MAIN_KEYBOARD)
+    else:
+        state_set("skip_next_slot", "1")
+        await update.message.reply_text(
+            f"⏸ Пропущу найближчий слот ({h}:00). Тема не згорить, далі все як звичайно. "
+            f"Натисни ще раз, щоб скасувати пропуск.",
+            reply_markup=MAIN_KEYBOARD)
+
+
 async def on_menu_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != OWNER_CHAT_ID:
         return
@@ -629,6 +716,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Команди:\n"
         "/post — запропонувати пост зараз (для тесту)\n"
         "/status — скільки тем лишилось\n"
+        "/skip — пропустити найближчий слот (повторно: скасувати пропуск)\n"
         "/whoami — показати твій Telegram ID\n\n"
         "Внизу завжди є меню: кнопка \"Опублікувати зараз\" робить те саме, "
         "що /post, без потреби щось набирати.",
@@ -649,11 +737,14 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     photos = "так" if PUBLIC_BASE_URL else "НЕ налаштовано (PUBLIC_BASE_URL)"
     await update.message.reply_text(
         f"📊 Статус:\n"
-        f"• Тем у банку: {left}\n"
+        f"• Тем у банку: {left} (з них кейсів {remaining_count('case')})\n"
         f"• Пропущено назавжди: {skipped_count()}\n"
         f"• Чекає підтвердження: {pending}\n"
         f"• Фото: {photos}\n"
-        f"• Розклад: {POST_HOUR_1}:00 і {POST_HOUR_2}:00 (Київ)",
+        f"• Розклад: {', '.join(f'{h}:00' for h in slot_hours())} (Київ)"
+        f"{f', кейси о {POST_HOUR_3}:00' if POST_HOUR_3 is not None else ''}\n"
+        f"• Пропустити наступний слот: {'так' if state_get('skip_next_slot') == '1' else 'ні'}\n"
+        f"• Мінімальна пауза між постами: {MIN_GAP_HOURS:g} год",
         reply_markup=MAIN_KEYBOARD)
 
 
@@ -679,23 +770,30 @@ def main():
     app.add_handler(CommandHandler("post", cmd_post))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CommandHandler("skip", on_menu_skip_slot))
     app.add_handler(CallbackQueryHandler(on_button))
 
     # Кнопки постійного меню — ДО загального текстового хендлера,
     # інакше on_text їх перехопить першим.
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_POST_NOW)}$"), on_menu_post_now))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_STATUS)}$"), on_menu_status))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_SKIP_SLOT)}$"), on_menu_skip_slot))
 
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     jq = app.job_queue
-    jq.run_daily(job_scheduled_post, time=dt_time(POST_HOUR_1, 0, tzinfo=TZ))
-    jq.run_daily(job_scheduled_post, time=dt_time(POST_HOUR_2, 0, tzinfo=TZ))
+    jq.run_daily(job_scheduled_post, time=dt_time(POST_HOUR_1, 0, tzinfo=TZ),
+                 data={"hour": POST_HOUR_1, "kind": "general"})
+    if POST_HOUR_3 is not None:
+        jq.run_daily(job_scheduled_post, time=dt_time(POST_HOUR_3, 0, tzinfo=TZ),
+                     data={"hour": POST_HOUR_3, "kind": "case"})
+    jq.run_daily(job_scheduled_post, time=dt_time(POST_HOUR_2, 0, tzinfo=TZ),
+                 data={"hour": POST_HOUR_2, "kind": "general"})
     jq.run_repeating(job_refresh_token, interval=30 * 24 * 3600, first=60)
     jq.run_once(job_send_menu, when=3)
 
-    logger.info("Threads-агент (v4) запущено.")
+    logger.info("Threads-агент (v5) запущено.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
