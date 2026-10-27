@@ -76,7 +76,6 @@ POST_HOUR_2 = int(os.getenv("POST_HOUR_2", "18"))
 _h3 = os.getenv("POST_HOUR_3", "13").strip().lower()
 POST_HOUR_3 = int(_h3) if _h3.isdigit() else None
 # Якщо в Threads був пост (свій чи ручний) менше ніж N год тому, слот пропускається.
-MIN_GAP_HOURS = float(os.getenv("MIN_GAP_HOURS", "3"))
 TZ = ZoneInfo("Europe/Kyiv")
 
 LOW_BANK_THRESHOLD = 3
@@ -307,25 +306,6 @@ def get_threads_user_id():
     return THREADS_USER_ID
 
 
-def minutes_since_last_post():
-    """Скільки хвилин минуло з останнього поста в Threads (будь-якого: від бота
-       чи опублікованого вручну). None, якщо дізнатись не вдалось."""
-    try:
-        uid = get_threads_user_id()
-        r = requests.get(f"{GRAPH}/{uid}/threads",
-                         params={"fields": "timestamp", "limit": 1,
-                                 "access_token": THREADS_ACCESS_TOKEN}, timeout=20)
-        r.raise_for_status()
-        items = r.json().get("data", [])
-        if not items:
-            return None
-        ts = datetime.strptime(items[0]["timestamp"], "%Y-%m-%dT%H:%M:%S%z")
-        return (datetime.now(TZ) - ts).total_seconds() / 60
-    except Exception as e:
-        logger.error(f"Не вдалось перевірити останній пост: {e}")
-        return None
-
-
 def slot_hours():
     return sorted(h for h in (POST_HOUR_1, POST_HOUR_3, POST_HOUR_2) if h is not None)
 
@@ -333,7 +313,7 @@ def slot_hours():
 def next_slot_hour():
     now = datetime.now(TZ)
     for h in slot_hours():
-        if h > now.hour or (h == now.hour and now.minute == 0):
+        if h > now.hour:
             return h
     return slot_hours()[0]
 
@@ -531,15 +511,8 @@ async def job_scheduled_post(ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=MAIN_KEYBOARD)
         return
 
-    # 2) Нещодавно вже був пост (наприклад, ти опублікував щось сам)
-    mins = minutes_since_last_post()
-    if mins is not None and mins < MIN_GAP_HOURS * 60 and not state_get("pending_hash"):
-        await ctx.bot.send_message(
-            OWNER_CHAT_ID,
-            f"⏸ Пропустив слот {hour}:00: останній пост у Threads був {int(mins)} хв тому, "
-            f"не хочу два пости поспіль. Наступний о {next_slot_hour()}:00.",
-            reply_markup=MAIN_KEYBOARD)
-        return
+    # Сам бот слоти більше не пропускає: пропускати вирішує лише Артем
+    # (кнопка «⏸ Пропустити наступний слот» або «⏭ Пропустити назавжди» під постом).
 
     await do_scheduled_post(ctx.application, kind)
 
@@ -745,8 +718,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"• Фото: {photos}\n"
         f"• Розклад: {', '.join(f'{h}:00' for h in slot_hours())} (Київ)"
         f"{f', кейси о {POST_HOUR_3}:00' if POST_HOUR_3 is not None else ''}\n"
-        f"• Пропустити наступний слот: {'так' if state_get('skip_next_slot') == '1' else 'ні'}\n"
-        f"• Мінімальна пауза між постами: {MIN_GAP_HOURS:g} год",
+        f"• Пропустити наступний слот: {'так' if state_get('skip_next_slot') == '1' else 'ні'}",
         reply_markup=MAIN_KEYBOARD)
 
 
