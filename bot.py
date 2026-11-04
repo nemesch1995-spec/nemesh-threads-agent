@@ -112,26 +112,40 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 # ───────────────────────────────────────────────
 
 class ImgHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+    def _serve(self, head_only=False):
         if self.path == "/" or self.path == "/health":
+            body = b"ok"
             self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b"ok")
+            if not head_only:
+                self.wfile.write(body)
             return
         if self.path.startswith("/img/"):
-            name = os.path.basename(self.path[len("/img/"):])
+            name = os.path.basename(self.path[len("/img/"):].split("?")[0])
             fp = os.path.join(IMAGES_DIR, name)
             if os.path.isfile(fp):
                 ctype = mimetypes.guess_type(fp)[0] or "application/octet-stream"
+                with open(fp, "rb") as f:
+                    data = f.read()
                 self.send_response(200)
                 self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "public, max-age=86400")
                 self.end_headers()
-                with open(fp, "rb") as f:
-                    self.wfile.write(f.read())
+                if not head_only:
+                    self.wfile.write(data)
                 return
         self.send_response(404)
+        self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def do_GET(self):
+        self._serve()
+
+    def do_HEAD(self):
+        # Meta перед завантаженням фото інколи робить HEAD; без нього був 501
+        self._serve(head_only=True)
 
     def log_message(self, *args):
         pass  # не засмічуємо логи
@@ -332,6 +346,23 @@ def _publish_container(uid, creation_id):
     raise RuntimeError(f"publish не вдався: {last}")
 
 
+def _wait_finished(ids, tries=8):
+    """Чекає, поки Threads завантажить усі фото каруселі (статус FINISHED)."""
+    for _ in range(tries):
+        states = []
+        for cid in ids:
+            try:
+                r = requests.get(f"{GRAPH}/{cid}",
+                                 params={"fields": "status", "access_token": THREADS_ACCESS_TOKEN},
+                                 timeout=15)
+                states.append(r.json().get("status") if r.ok else None)
+            except Exception:
+                states.append(None)
+        if all(st == "FINISHED" for st in states):
+            return
+        time.sleep(3)
+
+
 def publish_to_threads(text, image_urls=None):
     """Публікує пост. image_urls: [] текст, [1] фото, [2..10] карусель.
        Повертає (True, url) або (False, помилка)."""
@@ -363,6 +394,7 @@ def publish_to_threads(text, image_urls=None):
                 rc.raise_for_status()
                 child_ids.append(rc.json()["id"])
                 time.sleep(1)
+            _wait_finished(child_ids)
             rp = requests.post(f"{GRAPH}/{uid}/threads",
                                params={"access_token": THREADS_ACCESS_TOKEN,
                                        "media_type": "CAROUSEL",
@@ -387,10 +419,14 @@ def publish_to_threads(text, image_urls=None):
     except Exception as e:
         detail = ""
         try:
-            detail = e.response.json().get("error", {}).get("message", "")  # type: ignore
+            err = e.response.json().get("error", {})  # type: ignore
+            detail = err.get("error_user_msg") or err.get("message", "")
+            logger.error(f"Помилка публікації: code={err.get('code')} "
+                         f"subcode={err.get('error_subcode')} msg={err.get('message')} "
+                         f"user={err.get('error_user_msg')} url={getattr(e.response, 'url', '')[:80]}")
         except Exception:
             detail = str(e)
-        logger.error(f"Помилка публікації: {detail}")
+            logger.error(f"Помилка публікації: {detail}")
         return False, detail
 
 
