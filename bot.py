@@ -261,6 +261,9 @@ def cleanup_image_files():
 # БАНК ТЕМ
 # ───────────────────────────────────────────────
 
+HINTS = {}  # post_hash -> підказка «# фото: ...» з банку
+
+
 def fetch_bank():
     if not BANK_URL:
         return []
@@ -278,6 +281,9 @@ def fetch_bank():
         text = "\n".join(lines).strip()
         if text:
             posts.append((text, kind))
+            m = re.search(r"(?mi)^\s*#\s*(?:фото|порада:\s*фото)\s*:?\s*(.*)$", chunk)
+            if m:
+                HINTS[post_hash(text)] = m.group(1).strip() or "додай картинку"
     return posts
 
 
@@ -498,6 +504,10 @@ async def send_for_approval(app, text, h):
     left = remaining_count()
     header = (f"📝 <b>Пост на сьогодні</b>  ·  у банку лишилось: {left} "
               f"(кейсів {remaining_count('case')})\n\n")
+    hint = HINTS.get(h)
+    if hint:
+        import html as _html
+        header += f"📷 <i>Підказка до фото: {_html.escape(hint)}</i>\n\n"
     await app.bot.send_message(chat_id=OWNER_CHAT_ID, text=header + text,
                                parse_mode="HTML", reply_markup=approval_keyboard())
 
